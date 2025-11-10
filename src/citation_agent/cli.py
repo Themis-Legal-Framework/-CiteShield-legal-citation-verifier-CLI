@@ -85,6 +85,9 @@ def verify(
     except FileNotFoundError as exc:
         typer.secho(str(exc), fg=typer.colors.RED)
         raise typer.Exit(code=1) from exc
+    except (RuntimeError, ValueError) as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(code=1) from exc
     except Exception as exc:  # pragma: no cover - defensive
         typer.secho(f"Agent run failed: {exc}", fg=typer.colors.RED)
         raise typer.Exit(code=2) from exc
