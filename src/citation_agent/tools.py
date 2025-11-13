@@ -17,10 +17,102 @@ agent execution.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+import logging
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from agents import RunContextWrapper, function_tool
 
 from .document import DocumentChunk
+
+
+logger = logging.getLogger(__name__)
+
+
+class AuthorityLookupError(Exception):
+    """Raised when the external authority lookup API fails."""
+
+
+class MissingCredentialsError(AuthorityLookupError):
+    """Raised when the authority lookup API credentials are unavailable."""
+
+
+@dataclass(slots=True)
+class AuthorityLookupClient:
+    """HTTP client responsible for querying an external legal database."""
+
+    base_url: str
+    api_key: str | None = None
+    timeout: float = 10.0
+
+    def lookup(self, citation: str, *, jurisdiction: str | None = None) -> dict[str, Any]:
+        """Perform a lookup request against the configured API."""
+
+        if not citation or not citation.strip():
+            raise ValueError("citation must not be empty")
+        if not self.base_url:
+            raise AuthorityLookupError("Authority lookup base URL is not configured.")
+        if not self.api_key:
+            raise MissingCredentialsError("Authority lookup API key is missing.")
+
+        params: dict[str, Any] = {"citation": citation}
+        if jurisdiction:
+            params["jurisdiction"] = jurisdiction
+
+        query = urlencode(params)
+        separator = "&" if "?" in self.base_url else "?"
+        request_url = f"{self.base_url}{separator}{query}" if query else self.base_url
+
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "citeshield/0.1",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+        request = Request(request_url, headers=headers)
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                status = getattr(response, "status", None)
+                if status is None:
+                    status = getattr(response, "code", None)
+                if status is not None and int(status) >= 400:
+                    raise AuthorityLookupError(
+                        f"Authority lookup failed with status code {status}"
+                    )
+                raw = response.read()
+        except HTTPError as exc:  # pragma: no cover - HTTP failure details
+            raise AuthorityLookupError(
+                f"Authority lookup failed with status code {exc.code}"
+            ) from exc
+        except URLError as exc:
+            raise AuthorityLookupError(f"Authority lookup request failed: {exc.reason}") from exc
+
+        if not raw:
+            raise AuthorityLookupError("Authority lookup response was empty.")
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise AuthorityLookupError("Authority lookup returned invalid JSON.") from exc
+
+        snippets = payload.get("snippets")
+        if isinstance(snippets, str):
+            snippets = [snippets]
+        elif not isinstance(snippets, list):
+            snippets = []
+
+        return {
+            "authority_name": payload.get("authority_name")
+            or payload.get("title")
+            or citation,
+            "citation": payload.get("citation", citation),
+            "jurisdiction": payload.get("jurisdiction", jurisdiction),
+            "snippets": snippets,
+            "metadata": payload,
+        }
 
 
 @dataclass
@@ -35,11 +127,13 @@ class BriefContext:
         document_name: Name of the file being analyzed
         chunks: List of DocumentChunk objects containing the full document
         overview: Precomputed summary of document structure
+        authority_lookup_client: Optional helper for querying external authorities
     """
 
     document_name: str
     chunks: list[DocumentChunk] = field(default_factory=list)
     overview: str = ""
+    authority_lookup_client: AuthorityLookupClient | None = None
 
     def get_chunk(self, section_index: int) -> DocumentChunk:
         """Retrieve a specific chunk by index.
@@ -199,6 +293,51 @@ def search_brief_sections_impl(
     return "\n".join(rows)
 
 
+def lookup_authority_impl(
+    ctx: RunContextWrapper[BriefContext],
+    citation: str,
+    jurisdiction: str | None = None,
+) -> str:
+    """Query a legal database for metadata about a cited authority."""
+
+    if not citation or not citation.strip():
+        return json.dumps(
+            {
+                "status": "error",
+                "message": "The citation parameter must not be empty.",
+            }
+        )
+
+    client = ctx.context.authority_lookup_client
+    if client is None:
+        return json.dumps(
+            {
+                "status": "unavailable",
+                "message": (
+                    "Authority lookup is not configured. Provide API credentials to enable it."
+                ),
+            }
+        )
+
+    try:
+        payload = client.lookup(citation, jurisdiction=jurisdiction)
+    except MissingCredentialsError as exc:
+        return json.dumps({"status": "error", "message": str(exc)})
+    except AuthorityLookupError as exc:
+        logger.warning("Authority lookup failed: %s", exc)
+        return json.dumps({"status": "error", "message": str(exc)})
+    except Exception:  # pragma: no cover - defensive logging
+        logger.exception("Unexpected failure during authority lookup")
+        return json.dumps(
+            {
+                "status": "error",
+                "message": "Unexpected authority lookup failure.",
+            }
+        )
+
+    return json.dumps({"status": "ok", "data": payload}, ensure_ascii=False)
+
+
 # Export tools wrapped with function_tool decorator for OpenAI agent integration
 list_brief_sections = function_tool(list_brief_sections_impl)
 """Agent tool: Browse document sections with pagination."""
@@ -208,3 +347,6 @@ get_brief_section = function_tool(get_brief_section_impl)
 
 search_brief_sections = function_tool(search_brief_sections_impl)
 """Agent tool: Search for sections by keyword query."""
+
+lookup_authority = function_tool(lookup_authority_impl)
+"""Agent tool: Query an external legal authority database."""
