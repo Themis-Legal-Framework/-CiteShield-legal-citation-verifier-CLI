@@ -12,10 +12,11 @@ workflow from raw document to structured CitationVerificationReport.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import inspect
 import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
@@ -25,7 +26,20 @@ from agents.items import ModelResponse
 
 from .document import annotate_document, chunk_document, load_document_text, summarize_chunks
 from .models import CitationVerificationReport
-from .tools import BriefContext, get_brief_section, list_brief_sections, search_brief_sections
+from .tools import (
+    AuthorityLookupClient,
+    BriefContext,
+    get_brief_section,
+    list_brief_sections,
+    lookup_authority,
+    search_brief_sections,
+)
+
+
+AUTHORITY_LOOKUP_API_KEY_ENV = "CITESHIELD_AUTHORITY_LOOKUP_API_KEY"
+AUTHORITY_LOOKUP_BASE_URL_ENV = "CITESHIELD_AUTHORITY_LOOKUP_BASE_URL"
+DEFAULT_AUTHORITY_LOOKUP_API_KEY = os.getenv(AUTHORITY_LOOKUP_API_KEY_ENV)
+DEFAULT_AUTHORITY_LOOKUP_BASE_URL = os.getenv(AUTHORITY_LOOKUP_BASE_URL_ENV)
 
 
 @dataclass(slots=True)
@@ -37,12 +51,20 @@ class AgentConfig:
         temperature: Sampling temperature (0.0-1.0), lower is more deterministic
         max_turns: Maximum reasoning iterations before timing out
         enable_web_search: Whether to provide the agent with web search capability
+        enable_authority_lookup: Enable the external legal authority lookup tool
+        authority_lookup_api_key: API key used to authenticate with the lookup service
+        authority_lookup_base_url: Endpoint URL for the legal authority lookup service
+        authority_lookup_timeout: Request timeout (seconds) for the lookup service
     """
 
     model: str = "gpt-4.1-mini"
     temperature: float = 0.1
     max_turns: int = 8
     enable_web_search: bool = True
+    enable_authority_lookup: bool = bool(DEFAULT_AUTHORITY_LOOKUP_BASE_URL)
+    authority_lookup_api_key: str | None = DEFAULT_AUTHORITY_LOOKUP_API_KEY
+    authority_lookup_base_url: str | None = DEFAULT_AUTHORITY_LOOKUP_BASE_URL
+    authority_lookup_timeout: float = 10.0
 
 
 logger = logging.getLogger(__name__)
@@ -281,7 +303,13 @@ class CitationAgentService:
         chunks = chunk_document(text)
         overview = summarize_chunks(chunks, limit=6)
         annotated_text = annotate_document(text)
-        context = BriefContext(document_name=document_name, chunks=chunks, overview=overview)
+        authority_client = self._build_authority_lookup_client()
+        context = BriefContext(
+            document_name=document_name,
+            chunks=chunks,
+            overview=overview,
+            authority_lookup_client=authority_client,
+        )
 
         agent = self._build_agent()
         agent_input = self._build_agent_input(context, annotated_text)
@@ -316,6 +344,9 @@ class CitationAgentService:
         """
 
         tools = [list_brief_sections, get_brief_section, search_brief_sections]
+        lookup_enabled, _, lookup_base_url, _ = self._resolve_authority_lookup_config()
+        if lookup_enabled and lookup_base_url:
+            tools.append(lookup_authority)
         if self.config.enable_web_search:
             tools.append(WebSearchTool())
 
@@ -327,7 +358,7 @@ class CitationAgentService:
                 "accessible through your tools. Extract each unique case, statute, regulation, or "
                 "secondary authority cited in the document. For every citation you must: "
                 "1) Restate the proposition credited to it, 2) confirm whether the authority truly "
-                "supports it by reading the brief and, if necessary, searching the open web, and "
+                "supports it by reading the brief and, if necessary, searching the open web or your legal database tools, and "
                 "3) mark hallucinations or weak support so the drafter can fix them. "
                 "Never invent citations; if you cannot find an authority after diligent searching, "
                 "set verification_status to 'not_found' and explain the gap. "
@@ -342,6 +373,20 @@ class CitationAgentService:
             model_settings=ModelSettings(temperature=self.config.temperature),
             output_type=CitationVerificationReport,
         )
+
+    def _resolve_authority_lookup_config(self) -> tuple[bool, str | None, str | None, float]:
+        env_api_key = os.getenv(AUTHORITY_LOOKUP_API_KEY_ENV)
+        env_base_url = os.getenv(AUTHORITY_LOOKUP_BASE_URL_ENV)
+        base_url = self.config.authority_lookup_base_url or env_base_url
+        api_key = self.config.authority_lookup_api_key or env_api_key
+        enabled = self.config.enable_authority_lookup or bool(base_url)
+        return enabled, api_key, base_url, self.config.authority_lookup_timeout
+
+    def _build_authority_lookup_client(self) -> AuthorityLookupClient | None:
+        enabled, api_key, base_url, timeout = self._resolve_authority_lookup_config()
+        if not enabled or not base_url:
+            return None
+        return AuthorityLookupClient(base_url=base_url, api_key=api_key, timeout=timeout)
 
     def _build_agent_input(self, context: BriefContext, annotated_text: str) -> str:
         """Construct the initial prompt for the agent.

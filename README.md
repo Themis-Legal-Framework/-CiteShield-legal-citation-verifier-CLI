@@ -36,6 +36,7 @@
 - **Line-Level References**: Pinpoints exact locations in source documents
 - **Configurable Models**: Works with various OpenAI models (gpt-4.1-mini, o4-mini, etc.)
 - **Extensible Architecture**: Easy to add custom tools or integrate with legal databases
+- **Authority Lookup Integration**: Optional external database queries surface metadata and snippets
 
 ## Quick Start
 
@@ -128,6 +129,36 @@ citation-agent verify brief.txt --temperature 0.0
 
 # Combine multiple options
 citation-agent verify brief.txt --model o4-mini --max-turns 15 --temperature 0.2
+```
+
+### Legal Authority Lookup (Optional)
+
+The `lookup_authority` tool lets CiteShield query an external legal database for
+case metadata and representative snippets. Configure it with environment
+variables before running the CLI:
+
+```bash
+export CITESHIELD_AUTHORITY_LOOKUP_BASE_URL="https://legaldb.example.com/authorities"
+export CITESHIELD_AUTHORITY_LOOKUP_API_KEY="your-api-key"
+```
+
+When a base URL is provided, the tool is automatically registered and the agent
+returns structured JSON (authority name, citation, jurisdiction, snippets, and
+raw metadata) for each lookup request. If credentials are missing, the tool will
+remain available but respond with a clear error message instead of failing the
+run.
+
+Programmatic callers can configure the client directly:
+
+```python
+from citation_agent import CitationAgentService, AgentConfig
+
+config = AgentConfig(
+    enable_authority_lookup=True,
+    authority_lookup_base_url="https://legaldb.example.com/authorities",
+    authority_lookup_api_key="your-api-key",
+)
+service = CitationAgentService(config=config)
 ```
 
 ### Output Formats

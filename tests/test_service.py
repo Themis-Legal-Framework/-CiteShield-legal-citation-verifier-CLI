@@ -34,6 +34,8 @@ class DummyResult:
 
 @pytest.fixture
 def dummy_service(monkeypatch):
+    monkeypatch.delenv("CITESHIELD_AUTHORITY_LOOKUP_BASE_URL", raising=False)
+    monkeypatch.delenv("CITESHIELD_AUTHORITY_LOOKUP_API_KEY", raising=False)
     svc = CitationAgentService(AgentConfig(enable_web_search=False))
     monkeypatch.setattr("citation_agent.service.Runner.run_sync", lambda *a, **kw: DummyResult())
     return svc
@@ -113,3 +115,49 @@ def test_progress_callback_receives_events(monkeypatch):
     llm_event = next((event for event in captured_events if event.event == "llm_end"), None)
     assert llm_event is not None
     assert llm_event.payload is not None and "reasoning" in llm_event.payload
+
+
+def test_agent_includes_lookup_tool(monkeypatch):
+    monkeypatch.delenv("CITESHIELD_AUTHORITY_LOOKUP_BASE_URL", raising=False)
+    monkeypatch.delenv("CITESHIELD_AUTHORITY_LOOKUP_API_KEY", raising=False)
+    config = AgentConfig(
+        enable_web_search=False,
+        enable_authority_lookup=True,
+        authority_lookup_base_url="https://api.example.com/authorities",
+        authority_lookup_api_key="secret",
+    )
+    service = CitationAgentService(config)
+
+    agent = service._build_agent()
+    tool_names = [getattr(tool, "name", "") for tool in agent.tools]
+
+    assert any(name.startswith("lookup_authority") for name in tool_names)
+
+
+def test_context_includes_authority_lookup_client(monkeypatch):
+    monkeypatch.delenv("CITESHIELD_AUTHORITY_LOOKUP_BASE_URL", raising=False)
+    monkeypatch.delenv("CITESHIELD_AUTHORITY_LOOKUP_API_KEY", raising=False)
+
+    captured: dict[str, object] = {}
+
+    def fake_run_sync(agent, agent_input, *, context, **kwargs):
+        captured["context"] = context
+        return DummyResult()
+
+    monkeypatch.setattr("citation_agent.service.Runner.run_sync", fake_run_sync)
+
+    config = AgentConfig(
+        enable_web_search=False,
+        enable_authority_lookup=True,
+        authority_lookup_base_url="https://api.example.com/authorities",
+        authority_lookup_api_key="secret",
+        authority_lookup_timeout=3.5,
+    )
+    service = CitationAgentService(config)
+
+    service.run_from_text("Sample", document_name="inline")
+
+    context = captured["context"]
+    assert context.authority_lookup_client is not None
+    assert context.authority_lookup_client.api_key == "secret"
+    assert context.authority_lookup_client.timeout == 3.5
